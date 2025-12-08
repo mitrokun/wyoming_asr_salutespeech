@@ -4,6 +4,6 @@
 * Установите зависимости pip (напрямую или в venv)
 * Запускайте сервер
 
-`python -m asr_salute --token "YOUKEY=="`
+`python -m asr_salute --token "YOURKEY=="`
 
 По дефолту будет слушать 10305 порт
