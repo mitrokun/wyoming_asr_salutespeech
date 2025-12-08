@@ -1,4 +1,4 @@
-## Реализация [потокого варианта](https://developers.sber.ru/docs/ru/salutespeech/api/grpc/recognition-stream-2) asr от SaluteSpeach в формате Wyoming сервера
+## Реализация [потокого варианта](https://developers.sber.ru/docs/ru/salutespeech/api/grpc/recognition-stream-2) asr от SaluteSpeech в формате Wyoming сервера
 
 * Получите ключ на сайте проекта
 * Установите зависимости pip (напрямую или в venv)
