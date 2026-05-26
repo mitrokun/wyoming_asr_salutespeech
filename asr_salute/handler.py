@@ -100,7 +100,6 @@ class SberEventHandler(AsyncEventHandler):
             options.enable_multi_utterance.enable = True 
             
             # Включаем частичные результаты
-            # Но пока будем использовать их только для дебага или игнорировать
             options.enable_partial_results.enable = True 
 
             async with grpc.aio.secure_channel("smartspeech.sber.ru:443", composite_creds) as channel:
@@ -110,22 +109,41 @@ class SberEventHandler(AsyncEventHandler):
 
                 # Запускаем двунаправленный стрим
                 stream = stub.Recognize(self._request_generator(options))
+                
+                # Счетчик слов для "железобетонного" вычисления новых дельт
+                last_word_count = 0
 
                 async for response in stream:
                     if response.HasField("transcription"):
                         tr = response.transcription
                         
-                        # Собираем текущий кусочек текста
-                        current_sentence = " ".join([hyp.normalized_text for hyp in tr.results])
+                        # Собираем текущий кусочек текста реплики (от Сбера приходит накопительно)
+                        current_sentence = " ".join([hyp.normalized_text for hyp in tr.results]).strip()
+                        
+                        # Механизм дельт на основе количества слов
+                        if current_sentence:
+                            current_words = current_sentence.split()
+                            if len(current_words) > last_word_count:
+                                # Берем срез массива: только новые слова, которых мы еще не отправляли
+                                new_words = current_words[last_word_count:]
+                                delta = " ".join(new_words)
+                                
+                                # Обновляем счетчик
+                                last_word_count = len(current_words)
+                                
+                                # Отправляем дельту (новые слова)
+                                await self.write_event(TranscriptChunk(text=delta).event())
                         
                         # Если это EOU (конец фразы/предложения)
                         if tr.eou:
                             if current_sentence:
                                 _LOGGER.debug("Utterance recognized: %s", current_sentence)
                                 self.full_transcript.append(current_sentence)
+                            
+                            # Сбрасываем счетчик слов, так как следующая фраза начнется с нуля
+                            last_word_count = 0
                                
                 # Цикл `async for` закончится, когда _request_generator выйдет (AudioStop) 
-                # и Сбер обработает последние байты.
             
             # Собираем весь накопленный текст
             final_text = " ".join(self.full_transcript)
