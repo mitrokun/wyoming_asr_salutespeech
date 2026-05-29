@@ -33,6 +33,8 @@ class SberEventHandler(AsyncEventHandler):
         self.recognition_task = None
         self.is_streaming = False
         self.full_transcript = []
+        self.sent_words = []
+        self.session_has_text = False
 
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
@@ -42,9 +44,10 @@ class SberEventHandler(AsyncEventHandler):
         if AudioStart.is_type(event.type):
             _LOGGER.debug("AudioStart: Starting recognition session")
             self.is_streaming = True
-            self.full_transcript = [] # Очищаем буфер
+            self.full_transcript = []
+            self.sent_words = []
+            self.session_has_text = False
             
-            # Очищаем очередь аудио
             while not self.audio_queue.empty():
                 self.audio_queue.get_nowait()
                 
@@ -60,9 +63,8 @@ class SberEventHandler(AsyncEventHandler):
         if AudioStop.is_type(event.type):
             _LOGGER.debug("AudioStop: Client finished sending audio")
             self.is_streaming = False
-            await self.audio_queue.put(None) # Сигнал для gRPC генератора, что данные кончились
+            await self.audio_queue.put(None)
             
-            # Ждем пока доработает задача распознавания
             if self.recognition_task:
                 await self.recognition_task
             return False
@@ -70,11 +72,7 @@ class SberEventHandler(AsyncEventHandler):
         return True
 
     async def _request_generator(self, options) -> AsyncGenerator[recognition_pb2.RecognitionRequest, None]:
-        """Reads from asyncio queue and yields to gRPC."""
-        # 1. Сначала шлем настройки
         yield recognition_pb2.RecognitionRequest(options=options)
-
-        # 2. Потом шлем чанки, пока не придет None (AudioStop от клиента)
         while True:
             audio_data = await self.audio_queue.get()
             if audio_data is None:
@@ -94,12 +92,7 @@ class SberEventHandler(AsyncEventHandler):
             options.sample_rate = 16000
             options.channels_count = 1
             
-            # Включаем multi_utterance. 
-            # Теперь Сбер не закроет стрим после первой фразы, а будет слать результаты один за другим.
-            # Закрытие произойдет только когда мы закроем стрим на отправку (AudioStop).
             options.enable_multi_utterance.enable = True 
-            
-            # Включаем частичные результаты
             options.enable_partial_results.enable = True 
 
             async with grpc.aio.secure_channel("smartspeech.sber.ru:443", composite_creds) as channel:
@@ -107,45 +100,64 @@ class SberEventHandler(AsyncEventHandler):
                 
                 await self.write_event(TranscriptStart().event())
 
-                # Запускаем двунаправленный стрим
                 stream = stub.Recognize(self._request_generator(options))
                 
-                # Счетчик слов для "железобетонного" вычисления новых дельт
-                last_word_count = 0
+                self.sent_words = []
+                self.session_has_text = False
 
                 async for response in stream:
                     if response.HasField("transcription"):
                         tr = response.transcription
                         
-                        # Собираем текущий кусочек текста реплики (от Сбера приходит накопительно)
                         current_sentence = " ".join([hyp.normalized_text for hyp in tr.results]).strip()
                         
-                        # Механизм дельт на основе количества слов
                         if current_sentence:
                             current_words = current_sentence.split()
-                            if len(current_words) > last_word_count:
-                                # Берем срез массива: только новые слова, которых мы еще не отправляли
-                                new_words = current_words[last_word_count:]
-                                delta = " ".join(new_words)
+                            deltas_to_send = []
+                            
+                            for i, new_word in enumerate(current_words):
+                                # Кейс 1: Старое завершенное слово (пропускаем без изменений для сохранения индексации)
+                                if i < len(self.sent_words) - 1:
+                                    continue
                                 
-                                # Обновляем счетчик
-                                last_word_count = len(current_words)
+                                # Кейс 2: Слово на стыке (которое могло быть неполным, например "по" -> "попробуем")
+                                elif i == len(self.sent_words) - 1:
+                                    old_word = self.sent_words[i]
+                                    if new_word == old_word:
+                                        continue
+                                    elif new_word.startswith(old_word):
+                                        # Это продолжение слова, берем только суффикс без пробела
+                                        suffix = new_word[len(old_word):]
+                                        deltas_to_send.append(suffix)
+                                        self.sent_words[i] = new_word
+                                    else:
+                                        # Слово изменилось полностью (например, "мы" -> "вы").
+                                        # Игнорируем замену на клиенте ради сохранения стабильности верстки,
+                                        # но сохраняем индекс выравнивания.
+                                        continue
                                 
-                                # Отправляем дельту (новые слова)
-                                await self.write_event(TranscriptChunk(text=delta).event())
+                                # Кейс 3: Новое слово (индекс больше длины отправленных слов)
+                                else:
+                                    if self.session_has_text:
+                                        delta_word = " " + new_word
+                                    else:
+                                        delta_word = new_word
+                                        self.session_has_text = True
+                                        
+                                    deltas_to_send.append(delta_word)
+                                    self.sent_words.append(new_word)
+                            
+                            if deltas_to_send:
+                                final_delta = "".join(deltas_to_send)
+                                await self.write_event(TranscriptChunk(text=final_delta).event())
                         
-                        # Если это EOU (конец фразы/предложения)
                         if tr.eou:
                             if current_sentence:
                                 _LOGGER.debug("Utterance recognized: %s", current_sentence)
                                 self.full_transcript.append(current_sentence)
                             
-                            # Сбрасываем счетчик слов, так как следующая фраза начнется с нуля
-                            last_word_count = 0
+                            self.sent_words = []
                                
-                # Цикл `async for` закончится, когда _request_generator выйдет (AudioStop) 
-            
-            # Собираем весь накопленный текст
             final_text = " ".join(self.full_transcript)
             
             if final_text:
